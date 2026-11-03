@@ -121,45 +121,44 @@
 
   /* ───────── Glass rim: a hairline of light around every slab surface ─────────
      Brightest on the top-left edge facing the light (−45°), faint on the far side,
-     with a slow glint travelling around the edge so it reads as shimmering glass. */
+     with a slow glint travelling around the edge so it reads as shimmering glass.
+     Both are painted straight into a 1px border with border-image, never by masking a filled
+     gradient down to a ring: some Safari versions dropped that mask and showed the whole gradient
+     as rays across the tile. The glint is ::before, the rim ::after, and an outline adds the faint
+     dark edge outside it so the edge still reads against white. */
   .glass { position: relative; }
-  .glass::before {
+  .glass::before, .glass::after {
     content: "";
     position: absolute;
     inset: 0;
     z-index: 1;
-    padding: 1px;
-    border-radius: inherit;
+    border: 1px solid transparent;
     pointer-events: none;
-    background:
-      conic-gradient(from var(--glint), transparent 0deg, rgb(255 255 255 / .95) 18deg, transparent 40deg, transparent 360deg),
-      linear-gradient(135deg, rgb(255 255 255 / .95), rgb(255 255 255 / .35) 45%, rgb(255 255 255 / .15) 60%, rgb(255 255 255 / .6));
-    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    -webkit-mask-composite: xor;
-            mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  }
+  .glass::before {
+    border-image: conic-gradient(from var(--glint), transparent 0deg, rgb(255 255 255 / .95) 18deg, transparent 40deg, transparent 360deg) 1;
     animation: glint 9s linear infinite;
     animation-delay: var(--glint-delay, 0s);
   }
-  /* a faint dark outline outside the light rim, so the edge still reads against white */
   .glass::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    border-radius: inherit;
-    pointer-events: none;
-    box-shadow: 0 0 0 1px rgb(var(--ink) / .07);
+    border-image: linear-gradient(135deg, rgb(255 255 255 / .95), rgb(255 255 255 / .35) 45%, rgb(255 255 255 / .15) 60%, rgb(255 255 255 / .6)) 1;
+    outline: 1px solid rgb(var(--ink) / .07);
   }
   @keyframes glint { to { --glint: 360deg; } }
   /* while the cursor is on the play tile, the glint stops orbiting and sits on the edge nearest it
      (its angle is set in JS on the button and inherited here) */
   .tile.play.is-aiming::before {
     animation: none;
-    padding: 1.5px;
-    background:
-      conic-gradient(from var(--glint), transparent 0deg, rgb(255 255 255 / .95) 30deg, transparent 60deg, transparent 360deg),
-      linear-gradient(135deg, rgb(255 255 255 / .5), rgb(255 255 255 / .15) 50%, rgb(255 255 255 / .3));
+    border-width: 1.5px;
+    border-image: conic-gradient(from var(--glint), transparent 0deg, rgb(255 255 255 / .95) 30deg, transparent 60deg, transparent 360deg) 1;
   }
+  .tile.play.is-aiming::after {
+    border-width: 1.5px;
+    border-image: linear-gradient(135deg, rgb(255 255 255 / .5), rgb(255 255 255 / .15) 50%, rgb(255 255 255 / .3)) 1;
+  }
+  /* the time pill is round, which a border image can't follow: it keeps only the dark outline, and its
+     own inset highlight does the rim */
+  .scrub-pill.glass::before, .scrub-pill.glass::after { border-image: none; border-radius: inherit; }
 
   /* ───────── macOS window controls (light mode) ─────────
      macOS sizes, in points: 12pt circles 8pt apart, the first 14pt from the left edge and 16pt from the
@@ -338,7 +337,8 @@
       inset -10px 12px 14px rgb(var(--ink) / .16);
   }
   .disc-fixed { pointer-events: none; }
-  .disc-wrap.in-flight { filter: url(#motion-blur); }
+  /* the flying disc's motion blur is a plain CSS blur set per frame in moveDeck(): an SVG url() filter
+     on an HTML element runs on the CPU in Safari and cost ~100ms a frame during every skip */
   .disc-fixed.reflection { mix-blend-mode: screen; }
 
   /* ───────── Glass slab: opposite light, shadow falls up-left onto the face ───────── */
@@ -373,6 +373,7 @@
     display: block;
     will-change: transform;
   }
+  .refract-layer[hidden] { display: none; }
   .slab::after {
     content: "";
     position: absolute;
@@ -811,8 +812,10 @@
               <circle cx="664" cy="-15" r="224" fill="rgb(76 77 82)" fill-opacity=".08" filter="url(#ds-4)"/>
             </g>
           </svg>
-          <!-- the spinning disc: the only part redrawn through the glass every frame -->
-          <svg class="refract-layer" viewBox="0 0 1024 240">
+          <!-- the spinning disc, drawn on the GPU (#refract-gl) where WebGL is available; this SVG copy
+               runs the same lens through SVG filters and is shown only as the fallback -->
+          <canvas class="refract-layer" id="refract-gl" hidden></canvas>
+          <svg class="refract-layer" id="refract-disc" viewBox="0 0 1024 240">
           <g filter="url(#liquid-disc)">
             <g id="refract-deck">
             <g mask="url(#disc-hole)">
@@ -981,6 +984,152 @@
     etch.append(r);
   }
 
+  // ───────── The disc under the glass, on the GPU ─────────
+  // The SVG lens is exact, but Safari runs SVG filters on the CPU and the disc never stops turning,
+  // so it was redrawn on the CPU every frame. This is the same lens as a WebGL shader: the part of the
+  // deck that can show under the slab (cover art + sheen, the white rim, the fixed reflection and rim
+  // light; the hub never reaches the slab) is rebuilt per pixel from textures, then bent by the same rim
+  // profile as buildGlass(), split into red/green/blue and frosted. The SVG copy is the fallback.
+  const glass = (() => {
+    const canvas = document.getElementById('refract-gl'), svgCopy = document.getElementById('refract-disc');
+    let gl;
+    try { gl = canvas.getContext('webgl', { alpha: true, premultipliedAlpha: true, antialias: false, preserveDrawingBuffer: false }); } catch {}
+    if (!gl) return null;
+
+    const FS = `
+      precision highp float;
+      uniform vec2 uRes, uCenter;
+      uniform float uAngle, uBend, uBand, uSpread, uFrost;
+      uniform sampler2D uArt, uSheen, uRefl;
+      const vec2 SLAB = vec2(1024., 240.);
+      vec4 over(vec4 s, vec4 d) { return s + d * (1. - s.a); }
+      vec4 tex(sampler2D t, vec2 uv) { return all(greaterThanEqual(uv, vec2(0.))) && all(lessThanEqual(uv, vec2(1.))) ? texture2D(t, uv) : vec4(0.); }
+      // the deck at slab point q, premultiplied (what the SVG copy draws, before the lens)
+      vec4 scene(vec2 q) {
+        vec2 r = q - uCenter;
+        float d = length(r);
+        if (d > 232.) return vec4(0.);
+        float c = cos(uAngle), s = sin(uAngle);
+        vec2 l = vec2(c * r.x + s * r.y, -s * r.x + c * r.y);              // into the spinning disc's frame
+        float inside = 1. - smoothstep(223.5, 224.5, d);                   // clip to the disc
+        vec4 col = tex(uArt, (l + 224.) / 448.) * inside;
+        col = over(tex(uSheen, (l + 226.) / 452.) * inside, col);
+        col = over(vec4(.75 * (1. - smoothstep(.5, 1.5, abs(d - 223.)))), col);   // white rim, 2px at 75%
+        vec4 refl = tex(uRefl, (r + 224.) / 448.);                         // fixed, screen-blended
+        col = refl + col - refl * col;
+        vec2 u = (r + 224.) * (333.87 / 448.);                             // rim light: fixed ring, diagonal fade
+        float t = clamp((u.x + u.y) / (2. * 238.478), 0., 1.);
+        float a = t < .5 ? mix(.95, .15, t / .5) : mix(.15, .7, (t - .5) / .5);
+        return over(vec4(a * (1. - smoothstep(1.46, 2.46, abs(d - 222.)))), col);
+      }
+      // the lens: every rim samples from further inside the slab, (1 - depth / band)^2 of the bend
+      float rim(float d) { return d < uBand ? (1. - d / uBand) * (1. - d / uBand) : 0.; }
+      vec2 bend(vec2 p) {
+        float dl = p.x, dr = SLAB.x - 1. - p.x, dt = p.y, db = SLAB.y - 1. - p.y;
+        return vec2(dl < dr ? rim(dl) : -rim(dr), dt < db ? rim(dt) : -rim(db)) * uBend;
+      }
+      // one frost tap: red, green and blue each bent a little further (1 : 1.06 : 1.12), alphas screened
+      vec4 lens(vec2 p) {
+        vec2 b = bend(p);
+        vec4 r = scene(p + b), g = scene(p + b * (1. + uSpread * .5)), bl = scene(p + b * (1. + uSpread));
+        return vec4(r.r, g.g, bl.b, 1. - (1. - r.a) * (1. - g.a) * (1. - bl.a));
+      }
+      void main() {
+        vec2 p = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y) / uRes * SLAB;   // slab units, y down
+        if (length(p - uCenter) > 232. + uBend * (1. + uSpread) + 3. * uFrost) { gl_FragColor = vec4(0.); return; }
+        // frost: a 3 x 3 gaussian (sigma = uFrost) over the bent result, as the SVG blur does
+        float o = uFrost, e = exp(-.5), k = exp(-1.);
+        vec4 sum = lens(p)
+          + e * (lens(p + vec2(o, 0.)) + lens(p - vec2(o, 0.)) + lens(p + vec2(0., o)) + lens(p - vec2(0., o)))
+          + k * (lens(p + vec2(o, o)) + lens(p - vec2(o, o)) + lens(p + vec2(o, -o)) + lens(p - vec2(o, -o)));
+        gl_FragColor = sum / (1. + 4. * e + 4. * k);
+      }`;
+    const shader = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, shader(gl.VERTEX_SHADER, 'attribute vec2 a; void main() { gl_Position = vec4(a, 0., 1.); }'));
+    gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    const U = name => gl.getUniformLocation(prog, name);
+    gl.uniform1f(U('uBend'), GLASS.bend);
+    gl.uniform1f(U('uBand'), GLASS.band);
+    gl.uniform1f(U('uSpread'), GLASS.dispersion);
+    gl.uniform1f(U('uFrost'), GLASS.frost);
+    gl.uniform1i(U('uArt'), 0); gl.uniform1i(U('uSheen'), 1); gl.uniform1i(U('uRefl'), 2);
+
+    let failed = false, dirty = true, last = '', art = null, artSrc = null;
+    function fallBack() {                          // any trouble: hand the disc back to the SVG lens
+      failed = true; canvas.hidden = true; svgCopy.style.display = '';
+    }
+    canvas.addEventListener('webglcontextlost', fallBack);
+    // images go through a 2D canvas so SVG and cross-origin (Apple, CORS-enabled) sources upload alike
+    const textures = new Map(), waiting = new Map();   // src → texture; src → callbacks while it loads
+    function texture(src, unit, done) {
+      if (textures.has(src)) { done(textures.get(src)); return; }
+      if (waiting.has(src)) { waiting.get(src).push(done); return; }
+      waiting.set(src, [done]);
+      done = t => { const all = waiting.get(src) || []; waiting.delete(src); all.forEach(f => f(t)); };
+      const img = new Image();
+      if (/^https?:/.test(src)) img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        if (failed) return;
+        try {
+          const c = document.createElement('canvas'), side = Math.min(1024, img.naturalWidth || 448);
+          c.width = c.height = side;
+          c.getContext('2d').drawImage(img, 0, 0, side, side);
+          const t = gl.createTexture();
+          gl.activeTexture(gl.TEXTURE0 + unit);
+          gl.bindTexture(gl.TEXTURE_2D, t);
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+          for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+          textures.set(src, t);
+          done(t);
+        } catch { fallBack(); }                    // the GPU may not read this image
+      };
+      img.onerror = () => { if (src === artSrc) fallBack(); };
+      img.src = src;
+    }
+    let sheen = null, refl = null;
+    texture(ASSETS.sheen, 1, t => { sheen = t; dirty = true; });
+    texture(ASSETS.reflection, 2, t => { refl = t; dirty = true; });
+
+    function size() {
+      const r = canvas.getBoundingClientRect(), w = Math.round(r.width * devicePixelRatio), h = Math.round(r.height * devicePixelRatio);
+      if (w && h && (w !== canvas.width || h !== canvas.height)) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); dirty = true; }
+    }
+    addEventListener('resize', size);
+
+    return {
+      // ready a cover on the GPU ahead of time, so a skip never stalls on decoding and uploading it
+      preload(src) { if (!failed) texture(src, 0, () => {}); },
+      setArt(src) {
+        artSrc = src;
+        texture(src, 0, t => { if (artSrc === src) { art = t; dirty = true; } });
+      },
+      // once a frame: redraw only when the disc has turned or moved (paused and still costs nothing)
+      draw(deg, dx, dy) {
+        if (failed || !art || !sheen || !refl) return;
+        const key = `${deg.toFixed(2)} ${dx.toFixed(1)} ${dy.toFixed(1)}`;
+        if (key === last && !dirty) return;
+        if (canvas.hidden) { canvas.hidden = false; svgCopy.style.display = 'none'; size(); }
+        last = key; dirty = false;
+        gl.uniform2f(U('uRes'), canvas.width, canvas.height);
+        gl.uniform2f(U('uCenter'), 736 + dx, -95 + dy);
+        gl.uniform1f(U('uAngle'), deg * Math.PI / 180);
+        [[0, art], [1, sheen], [2, refl]].forEach(([unit, t]) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); });
+        gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        if (gl.getError() === gl.CONTEXT_LOST_WEBGL) fallBack();
+      },
+    };
+  })();
+
   let songLength = 298;    // seconds, current track
   const SPIN_SPEED = 75;   // deg/s, matches the Figma play segment
   const SPIN_UP = .45, SPIN_DOWN = .32;   // s, time constants: ease-in on play, short smooth coast on pause
@@ -1031,6 +1180,7 @@
     const turn = `rotate(${(base + extra) % 360}deg)`;
     discs.forEach(d => d.style.transform = turn);
     refractSpin.setAttribute('transform', `rotate(${(base + extra) % 360} 736 -95)`);
+    glass?.draw((base + extra) % 360, deckX, deckY);
     fill.style.width = `${shown * 100}%`;
     if (scrubbing || hovering) {                      // the pill always reports the playhead
       const t = Math.round(shown * songLength);      // time counts through the glide
@@ -1115,13 +1265,17 @@
   const discArt = entry => (entry.id === 'more-life' && ASSETS.disc) || ASSETS[`album-${entry.id}`] || covers[entry.id] || ASSETS['disc-blank'];
   const artLayers = [document.querySelector('.disc .art'), document.querySelector('#refract-spin image[data-asset="disc"]')];
   // decode the covers ahead of time so a skip never waits on image decoding
-  const preloadCovers = () => ALBUMS.forEach(a => { const img = new Image(); img.src = discArt(a); img.decode?.().catch(() => {}); });
+  const preloadCovers = () => ALBUMS.forEach(a => {
+    const img = new Image(); img.src = discArt(a); img.decode?.().catch(() => {});
+    glass?.preload(discArt(a));                        // and ready on the GPU for the glass
+  });
   setTimeout(preloadCovers, 800);
   function setDiscArt(entry) {
     const src = discArt(entry);
     artLayers[0].src = src;
     ghosts.forEach(g => g.src = src);
     artLayers[1].setAttribute('href', src);
+    glass?.setArt(src);
   }
   setDiscArt(TRACKS[0]);
   // Apple's lookup only sometimes sends the header that lets a page read it with fetch(), so it's asked
@@ -1176,11 +1330,13 @@
     if (!flight) return;
     const t = Math.min(1, (now - flight.start) / flight.dur);
     const [x, y] = pointOn(flight.path, flight.ease(t));
-    // directional blur from this frame's velocity: streaks along the way it's travelling
+    // blur from this frame's velocity, like a camera exposure (the SVG copy under the glass streaks along
+    // each axis; the disc itself gets an even CSS blur, which the GPU draws, scaled to read about the same)
     const sx = dt ? Math.min(30, Math.abs(x - deckX) / dt * SHUTTER) : 0;
     const sy = dt ? Math.min(30, Math.abs(y - deckY) / dt * SHUTTER) : 0;
     deckX = x; deckY = y;
     deck.style.translate = `${x}px ${y}px`;
+    deck.style.filter = `blur(${Math.min(12, Math.hypot(sx, sy) * .4).toFixed(1)}px)`;
     refractDeck.setAttribute('transform', `translate(${x} ${y})`);
     refractShadow.style.translate = `${x}px ${y}px`;   // slides as a layer, no redraw (1 slab unit = 1px)
     blurAmount.setAttribute('stdDeviation', `${sx.toFixed(1)} ${sy.toFixed(1)}`);
@@ -1188,6 +1344,7 @@
       const { done } = flight;
       flight = null;
       deck.classList.remove('in-flight');
+      deck.style.filter = '';
       refractDeck.removeAttribute('filter');
       lensRegion(LENS_AT_REST);
       blurAmount.setAttribute('stdDeviation', '0 0');
